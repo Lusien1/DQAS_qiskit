@@ -44,6 +44,12 @@ print(g(theta))
 
 For application of Differentiable Quantum Architecture Search, see [applications](/tensorcircuit/applications). Reference paper: https://arxiv.org/pdf/2010.08561.pdf.
 
+
+## Qiskit + PyTorch DQAS Example
+
+A Qiskit (circuit simulation) and PyTorch (optimization) version of DQAS is provided at
+`examples/QAOA_DQAS_qiskit_torch.py`.
+
 ## VQNHE
 
 For application of Variational Quantum-Neural Hybrid Eigensolver, see [applications](/tensorcircuit/applications). Reference paper: https://arxiv.org/pdf/2106.05105.pdf.
