@@ -19,7 +19,7 @@ from qiskit.quantum_info import DensityMatrix, Kraus, Operator, state_fidelity
 
 @dataclass
 class QEMConfig:
-    # number of qubits for QFT/QEM task
+    # number of qubits for QEM task
     n: int = 4
     # DQAS optimization iterations
     epochs: int = 40
@@ -27,9 +27,9 @@ class QEMConfig:
     batch: int = 24
     # optimizer learning rate for structure logits stp
     lr_structure: float = 0.2
-    # bit-flip probability for idle qubits in each QFT moment
+    # bit-flip probability for idle qubits in each Trotter moment
     p_idle: float = 0.2
-    # global bit-flip probability after each QFT moment
+    # global bit-flip probability after each Trotter moment
     p_sep: float = 0.02
     # random seed (torch / numpy / random unitary design)
     seed: int = 7
@@ -48,48 +48,29 @@ def _x_channel(p: float) -> Kraus:
     return Kraus([np.sqrt(1 - p) * i2, np.sqrt(p) * x])
 
 
-def trotter_experiment_circuit(
+def trotter_moments(
     n: int,
     *,
     h: float,
     j_over_h: float,
     steps: int,
     dt: float,
-) -> QuantumCircuit:
-    """
-    Build a first-order Trotter circuit for TFIM-like dynamics.
-
-    Hamiltonian (up to constants/sign convention):
-        H = J * Σ Z_i Z_{i+1} + h * Σ X_i,   with J/h fixed by `j_over_h`.
-    Here we set J = h * j_over_h.
-    """
+) -> List[List[Tuple[str, Tuple[int, ...], float]]]:
+    """Build explicit moments for the TFIM Trotter circuit."""
     j = h * j_over_h
-    qc = QuantumCircuit(n)
-
-    # Start from |+...+> to generate non-trivial evolution under TFIM terms.
-    for q in range(n):
-        qc.h(q)
-
-    # First-order Trotter: e^{-i dt(Hzz + Hx)} ≈ e^{-i dt Hzz} e^{-i dt Hx}
-    for _ in range(steps):
-        # nearest-neighbor ZZ interactions (open boundary)
-        for i in range(n - 1):
-            qc.rzz(2.0 * j * dt, i, i + 1)
-        # transverse-field X terms
-        for q in range(n):
-            qc.rx(2.0 * h * dt, q)
-
-    return qc
-
-
-def qft_moments(n: int) -> List[List[Tuple[str, Tuple[int, ...], float]]]:
-    """Build moments in the same logical order as the Cirq version."""
     moments: List[List[Tuple[str, Tuple[int, ...], float]]] = []
-    for i in reversed(range(n)):
-        moments.append([("h", (i,), 0.0)])
-        for d, j in enumerate(reversed(range(i))):
-            theta = np.pi / (2 ** (d + 1))
-            moments.append([("cp", (j, i), theta)])
+
+    # Initial |+...+> layer.
+    for q in range(n):
+        moments.append([("h", (q,), 0.0)])
+
+    # Trotter layers.
+    for _ in range(steps):
+        for i in range(n - 1):
+            moments.append([("rzz", (i, i + 1), 2.0 * j * dt)])
+        for q in range(n):
+            moments.append([("rx", (q,), 2.0 * h * dt)])
+
     return moments
 
 
@@ -143,13 +124,15 @@ def append_layer(qc: QuantumCircuit, layer: Sequence[Tuple[str, Tuple[int, ...],
     for name, qubits, theta in layer:
         if name == "h":
             qc.h(qubits[0])
-        elif name == "cp":
-            qc.cp(theta, qubits[0], qubits[1])
+        elif name == "rx":
+            qc.rx(theta, qubits[0])
+        elif name == "rzz":
+            qc.rzz(theta, qubits[0], qubits[1])
         else:
             raise ValueError(f"Unknown layer op {name}")
 
 
-def build_filled_qft_circuit(
+def build_filled_trotter_circuit(
     n: int,
     preset: Sequence[int],
     op_pool: Sequence[str],
@@ -160,23 +143,19 @@ def build_filled_qft_circuit(
     trotter_dt: float,
 ) -> QuantumCircuit:
     """
-    Build a visualization-friendly circuit: prepend + QFT + DQAS placeholder gates.
+    Build a visualization-friendly circuit: Trotter + DQAS placeholder gates.
 
     Note: noise channels are NOT drawn here (channels are applied on density matrix in
     `qem_loss`). This circuit is intended for architecture visualization only.
     """
-    moments = qft_moments(n)
+    moments = trotter_moments(
+        n, h=h, j_over_h=j_over_h, steps=trotter_steps, dt=trotter_dt
+    )
     slots = idle_slots(moments, n)
     if len(preset) != len(slots):
         raise ValueError(f"preset length {len(preset)} != slots length {len(slots)}")
 
-    qc = trotter_experiment_circuit(
-        n,
-        h=h,
-        j_over_h=j_over_h,
-        steps=trotter_steps,
-        dt=trotter_dt,
-    )
+    qc = QuantumCircuit(n)
     k = 0
     for layer in moments:
         append_layer(qc, layer)
@@ -202,34 +181,28 @@ def qem_loss(
     trotter_dt: float,
 ) -> float:
     """
-    Compute QEM objective: negative fidelity between ideal and noisy branches.
+    Compute QEM objective on Trotter experiment circuit:
+    negative fidelity between ideal and noisy branches.
 
-    - ideal branch: prepend + clean QFT
-    - noisy branch: prepend + (QFT + placeholder gates on idle slots) + noise channels
+    - ideal branch: clean trotter moments
+    - noisy branch: trotter moments + placeholder gates on idle slots + noise channels
     """
-    moments = qft_moments(n)
+    moments = trotter_moments(
+        n, h=h, j_over_h=j_over_h, steps=trotter_steps, dt=trotter_dt
+    )
     slots = idle_slots(moments, n)
 
     if len(preset) != len(slots):
         raise ValueError(f"preset length {len(preset)} != slots length {len(slots)}")
 
-    prepend = trotter_experiment_circuit(
-        n,
-        h=h,
-        j_over_h=j_over_h,
-        steps=trotter_steps,
-        dt=trotter_dt,
-    )
-
     # ideal branch
     ideal = QuantumCircuit(n)
-    ideal.compose(prepend, inplace=True)
     for layer in moments:
         append_layer(ideal, layer)
     dm_ideal = DensityMatrix.from_instruction(ideal)
 
     # noisy branch with placeholders + channels
-    dm_noisy = DensityMatrix.from_instruction(prepend)
+    dm_noisy = DensityMatrix.from_instruction(QuantumCircuit(n))
     x_idle = _x_channel(p_idle)
     x_sep = _x_channel(p_sep)
 
@@ -300,7 +273,18 @@ def train_qem_dqas(
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    p = len(idle_slots(qft_moments(cfg.n), cfg.n))
+    p = len(
+        idle_slots(
+            trotter_moments(
+                cfg.n,
+                h=cfg.h,
+                j_over_h=cfg.j_over_h,
+                steps=cfg.trotter_steps,
+                dt=cfg.trotter_dt,
+            ),
+            cfg.n,
+        )
+    )
     c = len(op_pool)
     stp = torch.nn.Parameter(0.01 * torch.randn(p, c))
     init_stp = stp.detach().clone()
@@ -374,7 +358,7 @@ def save_visualizations(
     final_prob = torch.softmax(final_stp, dim=1)
     init_preset = torch.argmax(init_prob, dim=1).tolist()
 
-    init_circuit = build_filled_qft_circuit(
+    init_circuit = build_filled_trotter_circuit(
         cfg.n,
         init_preset,
         op_pool,
@@ -383,7 +367,7 @@ def save_visualizations(
         trotter_steps=cfg.trotter_steps,
         trotter_dt=cfg.trotter_dt,
     )
-    final_circuit = build_filled_qft_circuit(
+    final_circuit = build_filled_trotter_circuit(
         cfg.n,
         best_preset,
         op_pool,
