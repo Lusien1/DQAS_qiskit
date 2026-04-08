@@ -8,6 +8,7 @@ optimize structure logits via a REINFORCE-style estimator.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -135,6 +136,37 @@ def append_layer(qc: QuantumCircuit, layer: Sequence[Tuple[str, Tuple[int, ...],
             raise ValueError(f"Unknown layer op {name}")
 
 
+def build_filled_qft_circuit(
+    n: int,
+    preset: Sequence[int],
+    op_pool: Sequence[str],
+    seed: int,
+) -> QuantumCircuit:
+    """
+    Build a visualization-friendly circuit: prepend + QFT + DQAS placeholder gates.
+
+    Note: noise channels are NOT drawn here (channels are applied on density matrix in
+    `qem_loss`). This circuit is intended for architecture visualization only.
+    """
+    moments = qft_moments(n)
+    slots = idle_slots(moments, n)
+    if len(preset) != len(slots):
+        raise ValueError(f"preset length {len(preset)} != slots length {len(slots)}")
+
+    qc = unitary_design(n, l=3, seed=seed)
+    k = 0
+    for layer in moments:
+        append_layer(qc, layer)
+        occ = set()
+        for _, qubits, _ in layer:
+            occ.update(qubits)
+        for q in range(n):
+            if q not in occ:
+                apply_named_single_qubit(qc, op_pool[preset[k]], q)
+                k += 1
+    return qc
+
+
 def qem_loss(
     n: int,
     preset: Sequence[int],
@@ -199,7 +231,9 @@ def qem_loss(
     return -float(fidelity)
 
 
-def train_qem_dqas(cfg: QEMConfig, op_pool: Sequence[str]) -> Tuple[torch.Tensor, List[float], List[int]]:
+def train_qem_dqas(
+    cfg: QEMConfig, op_pool: Sequence[str]
+) -> Tuple[torch.Tensor, List[float], List[int], torch.Tensor]:
     """
     DQAS structure optimization for discrete operator pools.
 
@@ -212,6 +246,7 @@ def train_qem_dqas(cfg: QEMConfig, op_pool: Sequence[str]) -> Tuple[torch.Tensor
     p = len(idle_slots(qft_moments(cfg.n), cfg.n))
     c = len(op_pool)
     stp = torch.nn.Parameter(0.01 * torch.randn(p, c))
+    init_stp = stp.detach().clone()
     optimizer = torch.optim.Adam([stp], lr=cfg.lr_structure)
 
     history: List[float] = []
@@ -259,23 +294,70 @@ def train_qem_dqas(cfg: QEMConfig, op_pool: Sequence[str]) -> Tuple[torch.Tensor
             print(f"epoch={epoch:03d} loss={baseline:.6f} p={p} c={c} best[:8]={best[:8]}")
 
     best_preset = torch.argmax(torch.softmax(stp, dim=1), dim=1).tolist()
-    return stp.detach(), history, best_preset
+    return stp.detach(), history, best_preset, init_stp
+
+
+def save_visualizations(
+    *,
+    cfg: QEMConfig,
+    op_pool: Sequence[str],
+    init_stp: torch.Tensor,
+    final_stp: torch.Tensor,
+    best_preset: Sequence[int],
+    out_dir: str = "qem_dqas_artifacts",
+) -> None:
+    """Save initial/final architecture visualization and parameter summaries."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    init_prob = torch.softmax(init_stp, dim=1)
+    final_prob = torch.softmax(final_stp, dim=1)
+    init_preset = torch.argmax(init_prob, dim=1).tolist()
+
+    init_circuit = build_filled_qft_circuit(cfg.n, init_preset, op_pool, seed=cfg.seed)
+    final_circuit = build_filled_qft_circuit(cfg.n, best_preset, op_pool, seed=cfg.seed)
+
+    # Text visualization is robust and does not require extra plotting dependencies.
+    (out / "initial_circuit.txt").write_text(str(init_circuit.draw(output="text")))
+    (out / "filled_circuit_after_dqas.txt").write_text(str(final_circuit.draw(output="text")))
+
+    # Save structure parameters (logits/probabilities) for both initial and final states.
+    np.savetxt(out / "initial_stp_logits.csv", init_stp.numpy(), delimiter=",")
+    np.savetxt(out / "final_stp_logits.csv", final_stp.numpy(), delimiter=",")
+    np.savetxt(out / "initial_stp_prob.csv", init_prob.numpy(), delimiter=",")
+    np.savetxt(out / "final_stp_prob.csv", final_prob.numpy(), delimiter=",")
+
+    # Human-readable mapping from slot to selected gate and probability.
+    lines = ["slot,init_gate,init_prob,final_gate,final_prob"]
+    for i, gidx in enumerate(best_preset):
+        init_idx = int(init_preset[i])
+        lines.append(
+            f"{i},{op_pool[init_idx]},{float(init_prob[i, init_idx]):.6f},"
+            f"{op_pool[gidx]},{float(final_prob[i, gidx]):.6f}"
+        )
+    (out / "architecture_summary.csv").write_text("\n".join(lines))
+
+    print(f"[visualization] saved to: {out.resolve()}")
+    print(f"[visualization] initial circuit: {out / 'initial_circuit.txt'}")
+    print(f"[visualization] final circuit:   {out / 'filled_circuit_after_dqas.txt'}")
 
 
 def main_3() -> None:
     op_pool = ["X", "Y", "Z", "I", "T", "S"]
     cfg = QEMConfig(n=3, epochs=30, batch=32)
-    _, history, best = train_qem_dqas(cfg, op_pool)
+    stp, history, best, init_stp = train_qem_dqas(cfg, op_pool)
     print("\n[QEM n=3] best architecture length:", len(best))
     print("[QEM n=3] last-5 history:", history[-5:])
+    save_visualizations(cfg=cfg, op_pool=op_pool, init_stp=init_stp, final_stp=stp, best_preset=best)
 
 
 def main_4() -> None:
     op_pool = ["I", "X", "Y", "Z", "H", "RX_PI_3", "RX_2PI_3", "RZ_PI_3", "RZ_2PI_3", "S", "T"]
     cfg = QEMConfig(n=4, epochs=20, batch=24)
-    _, history, best = train_qem_dqas(cfg, op_pool)
+    stp, history, best, init_stp = train_qem_dqas(cfg, op_pool)
     print("\n[QEM n=4] best architecture length:", len(best))
     print("[QEM n=4] last-5 history:", history[-5:])
+    save_visualizations(cfg=cfg, op_pool=op_pool, init_stp=init_stp, final_stp=stp, best_preset=best)
 
 
 if __name__ == "__main__":
