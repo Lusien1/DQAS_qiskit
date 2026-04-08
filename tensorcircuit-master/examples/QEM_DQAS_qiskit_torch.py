@@ -33,6 +33,12 @@ class QEMConfig:
     p_sep: float = 0.02
     # random seed (torch / numpy / random unitary design)
     seed: int = 7
+    # transverse-field Ising parameters with fixed ratio J/h = 0.15
+    h: float = 1.0
+    j_over_h: float = 0.15
+    # trotterization settings for the experiment circuit
+    trotter_steps: int = 3
+    trotter_dt: float = 0.3
 
 
 def _x_channel(p: float) -> Kraus:
@@ -42,29 +48,36 @@ def _x_channel(p: float) -> Kraus:
     return Kraus([np.sqrt(1 - p) * i2, np.sqrt(p) * x])
 
 
-def unitary_design(n: int, l: int = 3, seed: int = 0) -> QuantumCircuit:
+def trotter_experiment_circuit(
+    n: int,
+    *,
+    h: float,
+    j_over_h: float,
+    steps: int,
+    dt: float,
+) -> QuantumCircuit:
     """
-    Prepare a random pre-circuit to mimic the original unitary-design prepend stage.
+    Build a first-order Trotter circuit for TFIM-like dynamics.
 
-    This is a lightweight approximation of Haar-random state preparation and is used
-    as the QEM reference-state generator before applying QFT/noisy-QFT branches.
+    Hamiltonian (up to constants/sign convention):
+        H = J * Σ Z_i Z_{i+1} + h * Σ X_i,   with J/h fixed by `j_over_h`.
+    Here we set J = h * j_over_h.
     """
-    rng = np.random.default_rng(seed)
+    j = h * j_over_h
     qc = QuantumCircuit(n)
 
+    # Start from |+...+> to generate non-trivial evolution under TFIM terms.
     for q in range(n):
         qc.h(q)
 
-    for _ in range(l):
-        for q in range(n):
-            theta = rng.choice([0.0, 2 * np.pi / 3, 4 * np.pi / 3])
-            qc.rz(theta, q)
+    # First-order Trotter: e^{-i dt(Hzz + Hx)} ≈ e^{-i dt Hzz} e^{-i dt Hx}
+    for _ in range(steps):
+        # nearest-neighbor ZZ interactions (open boundary)
         for i in range(n - 1):
-            for j in range(i + 1, n):
-                if rng.random() < 0.5:
-                    qc.cz(i, j)
+            qc.rzz(2.0 * j * dt, i, i + 1)
+        # transverse-field X terms
         for q in range(n):
-            qc.h(q)
+            qc.rx(2.0 * h * dt, q)
 
     return qc
 
@@ -140,7 +153,11 @@ def build_filled_qft_circuit(
     n: int,
     preset: Sequence[int],
     op_pool: Sequence[str],
-    seed: int,
+    *,
+    h: float,
+    j_over_h: float,
+    trotter_steps: int,
+    trotter_dt: float,
 ) -> QuantumCircuit:
     """
     Build a visualization-friendly circuit: prepend + QFT + DQAS placeholder gates.
@@ -153,7 +170,13 @@ def build_filled_qft_circuit(
     if len(preset) != len(slots):
         raise ValueError(f"preset length {len(preset)} != slots length {len(slots)}")
 
-    qc = unitary_design(n, l=3, seed=seed)
+    qc = trotter_experiment_circuit(
+        n,
+        h=h,
+        j_over_h=j_over_h,
+        steps=trotter_steps,
+        dt=trotter_dt,
+    )
     k = 0
     for layer in moments:
         append_layer(qc, layer)
@@ -173,7 +196,10 @@ def qem_loss(
     op_pool: Sequence[str],
     p_idle: float,
     p_sep: float,
-    seed: int,
+    h: float,
+    j_over_h: float,
+    trotter_steps: int,
+    trotter_dt: float,
 ) -> float:
     """
     Compute QEM objective: negative fidelity between ideal and noisy branches.
@@ -187,7 +213,13 @@ def qem_loss(
     if len(preset) != len(slots):
         raise ValueError(f"preset length {len(preset)} != slots length {len(slots)}")
 
-    prepend = unitary_design(n, l=3, seed=seed)
+    prepend = trotter_experiment_circuit(
+        n,
+        h=h,
+        j_over_h=j_over_h,
+        steps=trotter_steps,
+        dt=trotter_dt,
+    )
 
     # ideal branch
     ideal = QuantumCircuit(n)
@@ -237,7 +269,10 @@ def qem_fidelity(
     op_pool: Sequence[str],
     p_idle: float,
     p_sep: float,
-    seed: int,
+    h: float,
+    j_over_h: float,
+    trotter_steps: int,
+    trotter_dt: float,
 ) -> float:
     """Convenience wrapper: fidelity = -qem_loss."""
     return -qem_loss(
@@ -246,7 +281,10 @@ def qem_fidelity(
         op_pool=op_pool,
         p_idle=p_idle,
         p_sep=p_sep,
-        seed=seed,
+        h=h,
+        j_over_h=j_over_h,
+        trotter_steps=trotter_steps,
+        trotter_dt=trotter_dt,
     )
 
 
@@ -287,7 +325,10 @@ def train_qem_dqas(
                 op_pool=op_pool,
                 p_idle=cfg.p_idle,
                 p_sep=cfg.p_sep,
-                seed=cfg.seed + b,
+                h=cfg.h,
+                j_over_h=cfg.j_over_h,
+                trotter_steps=cfg.trotter_steps,
+                trotter_dt=cfg.trotter_dt,
             )
             losses.append(loss)
 
@@ -333,8 +374,24 @@ def save_visualizations(
     final_prob = torch.softmax(final_stp, dim=1)
     init_preset = torch.argmax(init_prob, dim=1).tolist()
 
-    init_circuit = build_filled_qft_circuit(cfg.n, init_preset, op_pool, seed=cfg.seed)
-    final_circuit = build_filled_qft_circuit(cfg.n, best_preset, op_pool, seed=cfg.seed)
+    init_circuit = build_filled_qft_circuit(
+        cfg.n,
+        init_preset,
+        op_pool,
+        h=cfg.h,
+        j_over_h=cfg.j_over_h,
+        trotter_steps=cfg.trotter_steps,
+        trotter_dt=cfg.trotter_dt,
+    )
+    final_circuit = build_filled_qft_circuit(
+        cfg.n,
+        best_preset,
+        op_pool,
+        h=cfg.h,
+        j_over_h=cfg.j_over_h,
+        trotter_steps=cfg.trotter_steps,
+        trotter_dt=cfg.trotter_dt,
+    )
 
     # Text visualization is robust and does not require extra plotting dependencies.
     (out / "initial_circuit.txt").write_text(str(init_circuit.draw(output="text")))
@@ -363,7 +420,10 @@ def save_visualizations(
         op_pool=op_pool,
         p_idle=cfg.p_idle,
         p_sep=cfg.p_sep,
-        seed=cfg.seed,
+        h=cfg.h,
+        j_over_h=cfg.j_over_h,
+        trotter_steps=cfg.trotter_steps,
+        trotter_dt=cfg.trotter_dt,
     )
     final_fid = qem_fidelity(
         n=cfg.n,
@@ -371,7 +431,10 @@ def save_visualizations(
         op_pool=op_pool,
         p_idle=cfg.p_idle,
         p_sep=cfg.p_sep,
-        seed=cfg.seed,
+        h=cfg.h,
+        j_over_h=cfg.j_over_h,
+        trotter_steps=cfg.trotter_steps,
+        trotter_dt=cfg.trotter_dt,
     )
     fidelity_report = (
         "metric,value\n"
