@@ -231,6 +231,25 @@ def qem_loss(
     return -float(fidelity)
 
 
+def qem_fidelity(
+    n: int,
+    preset: Sequence[int],
+    op_pool: Sequence[str],
+    p_idle: float,
+    p_sep: float,
+    seed: int,
+) -> float:
+    """Convenience wrapper: fidelity = -qem_loss."""
+    return -qem_loss(
+        n=n,
+        preset=preset,
+        op_pool=op_pool,
+        p_idle=p_idle,
+        p_sep=p_sep,
+        seed=seed,
+    )
+
+
 def train_qem_dqas(
     cfg: QEMConfig, op_pool: Sequence[str]
 ) -> Tuple[torch.Tensor, List[float], List[int], torch.Tensor]:
@@ -337,9 +356,35 @@ def save_visualizations(
         )
     (out / "architecture_summary.csv").write_text("\n".join(lines))
 
+    # Fidelity comparison: initial architecture vs DQAS-selected architecture.
+    init_fid = qem_fidelity(
+        n=cfg.n,
+        preset=init_preset,
+        op_pool=op_pool,
+        p_idle=cfg.p_idle,
+        p_sep=cfg.p_sep,
+        seed=cfg.seed,
+    )
+    final_fid = qem_fidelity(
+        n=cfg.n,
+        preset=best_preset,
+        op_pool=op_pool,
+        p_idle=cfg.p_idle,
+        p_sep=cfg.p_sep,
+        seed=cfg.seed,
+    )
+    fidelity_report = (
+        "metric,value\n"
+        f"initial_fidelity,{init_fid:.10f}\n"
+        f"post_dqas_fidelity,{final_fid:.10f}\n"
+        f"fidelity_improvement,{(final_fid - init_fid):.10f}\n"
+    )
+    (out / "fidelity_report.csv").write_text(fidelity_report)
+
     print(f"[visualization] saved to: {out.resolve()}")
     print(f"[visualization] initial circuit: {out / 'initial_circuit.txt'}")
     print(f"[visualization] final circuit:   {out / 'filled_circuit_after_dqas.txt'}")
+    print(f"[fidelity] initial={init_fid:.8f}, post_dqas={final_fid:.8f}, delta={final_fid - init_fid:+.8f}")
 
 
 def main_3() -> None:
